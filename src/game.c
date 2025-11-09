@@ -91,23 +91,33 @@ void criar_nave(GameState* game) {
         pthread_mutex_unlock(&game->mutex_estado);
         return;
     }
+    /* Reserve spawn slot immediately to prevent race */
+    game->naves_spawned++;
+    int w = game->screen_width;
+    int hud = game->hud_height;
     pthread_mutex_unlock(&game->mutex_estado);
 
     pthread_mutex_lock(&game->mutex_naves);
     if (game->num_naves_ativas >= MAX_NAVES) {
         pthread_mutex_unlock(&game->mutex_naves);
+        /* Rollback spawn count since we can't actually spawn */
+        pthread_mutex_lock(&game->mutex_estado);
+        game->naves_spawned--;
+        pthread_mutex_unlock(&game->mutex_estado);
         return;
     }
     int idx = -1;
     for (int i = 0; i < MAX_NAVES; i++) {
         if (!game->naves[i].ativa) { idx = i; break; }
     }
-    if (idx == -1) { pthread_mutex_unlock(&game->mutex_naves); return; }
-
-    int w, hud;
-    pthread_mutex_lock(&game->mutex_estado);
-    w = game->screen_width; hud = game->hud_height;
-    pthread_mutex_unlock(&game->mutex_estado);
+    if (idx == -1) {
+        pthread_mutex_unlock(&game->mutex_naves);
+        /* Rollback spawn count since we can't actually spawn */
+        pthread_mutex_lock(&game->mutex_estado);
+        game->naves_spawned--;
+        pthread_mutex_unlock(&game->mutex_estado);
+        return;
+    }
 
     game->naves[idx].id = idx;
     game->naves[idx].x  = (w > 0) ? rand() % w : 0;
@@ -117,21 +127,37 @@ void criar_nave(GameState* game) {
     game->num_naves_ativas++;
     pthread_mutex_unlock(&game->mutex_naves);
 
-    pthread_mutex_lock(&game->mutex_estado);
-    game->naves_spawned++;
-    pthread_mutex_unlock(&game->mutex_estado);
-
     ThreadArgs* args = (ThreadArgs*)malloc(sizeof(ThreadArgs));
-    if (!args) return;
+    if (!args) {
+        /* rollback activation if we can't even allocate args */
+        pthread_mutex_lock(&game->mutex_naves);
+        game->naves[idx].ativa = false;
+        game->num_naves_ativas--;
+        pthread_mutex_unlock(&game->mutex_naves);
+        /* Rollback spawn count */
+        pthread_mutex_lock(&game->mutex_estado);
+        game->naves_spawned--;
+        pthread_mutex_unlock(&game->mutex_estado);
+        return;
+    }
+
     args->entity = &game->naves[idx];
     args->game = game;
     if (pthread_create(&game->naves[idx].thread_id, NULL, thread_nave, args) != 0) {
+        /* rollback activation on create failure */
         free(args);
         pthread_mutex_lock(&game->mutex_naves);
         game->naves[idx].ativa = false;
         game->num_naves_ativas--;
         pthread_mutex_unlock(&game->mutex_naves);
+        /* Rollback spawn count */
+        pthread_mutex_lock(&game->mutex_estado);
+        game->naves_spawned--;
+        pthread_mutex_unlock(&game->mutex_estado);
+        return;
     }
+
+    /* Success: spawn count already incremented above */
 }
 
 bool tentar_disparar(GameState* game) {
@@ -179,32 +205,50 @@ bool tentar_disparar(GameState* game) {
     game->lancadores[lancador_idx].tem_foguete = false;
     pthread_cond_signal(&game->cond_lancador_vazio);
 
-    /* Count as a shot only if we actually launched */
-    pthread_mutex_lock(&game->mutex_estado);
-    game->shots_fired++;
-    pthread_mutex_unlock(&game->mutex_estado);
-
-    fired = true;
-
     pthread_mutex_unlock(&game->mutex_foguetes);
     pthread_mutex_unlock(&game->mutex_lancadores);
 
     ThreadArgs* args = (ThreadArgs*)malloc(sizeof(ThreadArgs));
-    if (!args) return true;
+    if (!args) {
+        /* rollback launcher slot since we couldn’t launch */
+        pthread_mutex_lock(&game->mutex_foguetes);
+        game->foguetes[foguete_idx].ativa = false;
+        game->num_foguetes_ativos--;
+        pthread_mutex_unlock(&game->mutex_foguetes);
+
+        pthread_mutex_lock(&game->mutex_lancadores);
+        game->lancadores[lancador_idx].tem_foguete = true;
+        pthread_mutex_unlock(&game->mutex_lancadores);
+        return false;
+    }
+
     args->entity = &game->foguetes[foguete_idx];
     args->game = game;
     if (pthread_create(&game->foguetes[foguete_idx].thread_id, NULL, thread_foguete, args) != 0) {
+        /* rollback on create failure */
         free(args);
         pthread_mutex_lock(&game->mutex_foguetes);
         game->foguetes[foguete_idx].ativa = false;
         game->num_foguetes_ativos--;
         pthread_mutex_unlock(&game->mutex_foguetes);
-        fired = false;
+
+        pthread_mutex_lock(&game->mutex_lancadores);
+        game->lancadores[lancador_idx].tem_foguete = true;
+        pthread_mutex_unlock(&game->mutex_lancadores);
+        return false;
     }
+
+    /* Success: NOW count the shot */
+    pthread_mutex_lock(&game->mutex_estado);
+    game->shots_fired++;
+    pthread_mutex_unlock(&game->mutex_estado);
+
+    fired = true;
     return fired;
 }
 
 void finalizar_threads(GameState* game) {
+    /* Signal shutdown to all workers */
     pthread_mutex_lock(&game->mutex_estado);
     atomic_store(&game->game_over, true);
     pthread_cond_broadcast(&game->cond_game_over);
@@ -215,27 +259,29 @@ void finalizar_threads(GameState* game) {
     pthread_cond_broadcast(&game->cond_lancador_vazio);
     pthread_mutex_unlock(&game->mutex_lancadores);
 
-    pthread_t nave_tids[MAX_NAVES];
-    int nave_count = 0;
+    /* Snapshot ALL thread IDs that were ever created (join by id, not by 'ativa') */
+    pthread_t nave_tids[MAX_NAVES];    int nave_count = 0;
     pthread_mutex_lock(&game->mutex_naves);
     for (int i = 0; i < MAX_NAVES; i++) {
-        if (game->naves[i].ativa) {
+        if (game->naves[i].thread_id) {
             nave_tids[nave_count++] = game->naves[i].thread_id;
+            game->naves[i].thread_id = 0; /* prevent accidental double join */
         }
     }
     pthread_mutex_unlock(&game->mutex_naves);
 
-    pthread_t foguete_tids[MAX_FOGUETES];
-    int foguete_count = 0;
+    pthread_t foguete_tids[MAX_FOGUETES]; int foguete_count = 0;
     pthread_mutex_lock(&game->mutex_foguetes);
     for (int i = 0; i < MAX_FOGUETES; i++) {
-        if (game->foguetes[i].ativa) {
+        if (game->foguetes[i].thread_id) {
             foguete_tids[foguete_count++] = game->foguetes[i].thread_id;
+            game->foguetes[i].thread_id = 0;
         }
     }
     pthread_mutex_unlock(&game->mutex_foguetes);
 
-    for (int i = 0; i < nave_count; i++) pthread_join(nave_tids[i], NULL);
+    /* Join outside locks */
+    for (int i = 0; i < nave_count; i++)    pthread_join(nave_tids[i], NULL);
     for (int i = 0; i < foguete_count; i++) pthread_join(foguete_tids[i], NULL);
 
     pthread_join(game->thread_input, NULL);

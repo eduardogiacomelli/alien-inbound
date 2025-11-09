@@ -20,7 +20,7 @@ static inline int next_spawn_ms(const DifficultyConfig* cfg) {
 void* thread_principal(void* arg) {
     GameState* game = (GameState*)arg;
     struct timespec last_spawn_ts;
-    clock_gettime(CLOCK_REALTIME, &last_spawn_ts);
+    clock_gettime(CLOCK_MONOTONIC, &last_spawn_ts);
     int wait_ms = next_spawn_ms(&game->cfg);
 
     while (!atomic_load(&game->game_over)) {
@@ -51,14 +51,14 @@ void* thread_principal(void* arg) {
         /* Spawn logic: until total ships are spawned */
         if (spawned < total) {
             struct timespec now;
-            clock_gettime(CLOCK_REALTIME, &now);
+            clock_gettime(CLOCK_MONOTONIC, &now);
 
             long diff_ms = (now.tv_sec - last_spawn_ts.tv_sec) * 1000L
                          + (now.tv_nsec - last_spawn_ts.tv_nsec) / 1000000L;
 
             if (diff_ms >= wait_ms) {
                 criar_nave(game);
-                clock_gettime(CLOCK_REALTIME, &last_spawn_ts);
+                clock_gettime(CLOCK_MONOTONIC, &last_spawn_ts);
                 wait_ms = next_spawn_ms(&game->cfg);
             }
         }
@@ -103,16 +103,20 @@ void* thread_nave(void* arg) {
         pthread_mutex_unlock(&game->mutex_estado);
 
         if (ny >= (sh - ch - 1)) {
+            bool first = false;
             pthread_mutex_lock(&game->mutex_naves);
-            if (nave->ativa) {
+            if (nave->ativa) {         /* transition gate: ground reached once */
                 nave->ativa = false;
+                first = true;
             }
             pthread_mutex_unlock(&game->mutex_naves);
 
-            pthread_mutex_lock(&game->mutex_estado);
-            game->naves_chegaram++;
-            game->current_streak = 0; /* break combo */
-            pthread_mutex_unlock(&game->mutex_estado);
+            if (first) {
+                pthread_mutex_lock(&game->mutex_estado);
+                game->naves_chegaram++;
+                game->current_streak = 0; /* break combo */
+                pthread_mutex_unlock(&game->mutex_estado);
+            }
             break;
         }
 
@@ -133,22 +137,25 @@ void* thread_nave(void* arg) {
         pthread_mutex_unlock(&game->mutex_foguetes);
 
         if (colidiu) {
+            bool first = false;
             pthread_mutex_lock(&game->mutex_naves);
-            if (nave->ativa) {
+            if (nave->ativa) {           /* transition gate: only one thread counts kill */
                 nave->ativa = false;
                 nave->destruida = true;
+                first = true;
             }
             pthread_mutex_unlock(&game->mutex_naves);
 
-            render_add_explosion(nx, ny);
-
-            pthread_mutex_lock(&game->mutex_estado);
-            game->naves_destruidas++;
-            game->pontuacao += 10;
-            game->shots_hit++;
-            game->current_streak++;
-            if (game->current_streak > game->best_streak) game->best_streak = game->current_streak;
-            pthread_mutex_unlock(&game->mutex_estado);
+            if (first) {
+                render_add_explosion(nx, ny);
+                pthread_mutex_lock(&game->mutex_estado);
+                game->naves_destruidas++;
+                game->pontuacao += 10;
+                game->shots_hit++;
+                game->current_streak++;
+                if (game->current_streak > game->best_streak) game->best_streak = game->current_streak;
+                pthread_mutex_unlock(&game->mutex_estado);
+            }
             break;
         }
 
@@ -196,9 +203,9 @@ void* thread_foguete(void* arg) {
             break;
         }
 
-        /* rocket-side collision */
+        /* rocket-side collision (same forgiving box) */
         int fx = f->x, fy = f->y;
-        bool hit = false; int hit_ship = -1;
+        bool hit = false; int hit_ship = -1; bool first = false;
 
         pthread_mutex_lock(&game->mutex_naves);
         for (int i = 0; i < MAX_NAVES; i++) {
@@ -206,8 +213,10 @@ void* thread_foguete(void* arg) {
                 int dx = abs(game->naves[i].x - fx);
                 int dy = abs(game->naves[i].y - fy);
                 if (dx <= 2 && dy <= 2) {
+                    /* transition gate: only count if we flip ativa->false */
                     game->naves[i].ativa = false;
                     game->naves[i].destruida = true;
+                    first = true;
                     hit_ship = i;
                     hit = true;
                     break;
@@ -221,7 +230,7 @@ void* thread_foguete(void* arg) {
             f->ativa = false;
             pthread_mutex_unlock(&game->mutex_foguetes);
 
-            if (hit_ship >= 0) {
+            if (hit_ship >= 0 && first) {
                 int ex, ey;
                 pthread_mutex_lock(&game->mutex_naves);
                 ex = game->naves[hit_ship].x;
@@ -229,13 +238,15 @@ void* thread_foguete(void* arg) {
                 pthread_mutex_unlock(&game->mutex_naves);
                 render_add_explosion(ex, ey);
             }
-            pthread_mutex_lock(&game->mutex_estado);
-            game->naves_destruidas++;
-            game->pontuacao += 10;
-            game->shots_hit++;
-            game->current_streak++;
-            if (game->current_streak > game->best_streak) game->best_streak = game->current_streak;
-            pthread_mutex_unlock(&game->mutex_estado);
+            if (first) {
+                pthread_mutex_lock(&game->mutex_estado);
+                game->naves_destruidas++;
+                game->pontuacao += 10;
+                game->shots_hit++;
+                game->current_streak++;
+                if (game->current_streak > game->best_streak) game->best_streak = game->current_streak;
+                pthread_mutex_unlock(&game->mutex_estado);
+            }
             break;
         }
 

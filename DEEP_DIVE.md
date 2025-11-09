@@ -487,18 +487,22 @@ void criar_nave(GameState* game)
 
 **Thread Safety Analysis**:
 
-1. **Check spawn limit** (mutex_estado)
+1. **Check spawn limit and reserve slot** (mutex_estado)
 ```c
 pthread_mutex_lock(&game->mutex_estado);
 if (game->naves_spawned >= game->naves_total) {
     pthread_mutex_unlock(&game->mutex_estado);
     return;
 }
+/* Reserve spawn slot immediately to prevent race */
+game->naves_spawned++;
+int w = game->screen_width;
+int hud = game->hud_height;
 pthread_mutex_unlock(&game->mutex_estado);
 ```
-**Why unlock before checking array?** Reduces lock hold time. The check is atomic (read, compare, return).
+**Why increment immediately?** Uses "reserve then commit" pattern. Once we increment under lock, no other thread can pass the check. If spawn fails later, we rollback the count.
 
-**Potential Race**: Between unlock and array access, another thread could increment `naves_spawned`. This is **acceptable** - we might spawn one extra ship, which is fine.
+**Thread Safety**: ✅ **Race-free** - increment happens atomically under lock before any other thread can check.
 
 2. **Find empty slot** (mutex_naves)
 ```c
@@ -540,13 +544,16 @@ game->num_naves_ativas++;
 
 **Why spawn at `hud`?** Just below HUD (line 3), so ship appears in game area.
 
-5. **Increment spawn counter** (mutex_estado)
+5. **Rollback on failure** (mutex_estado)
 ```c
+// If spawn fails at any point (array full, malloc fails, thread create fails):
 pthread_mutex_lock(&game->mutex_estado);
-game->naves_spawned++;
+game->naves_spawned--;  // Rollback the reserved slot
 pthread_mutex_unlock(&game->mutex_estado);
 ```
-**Why separate lock?** Different mutex protects different data. This is correct.
+**Why rollback?** We reserved the slot at the start (incremented `naves_spawned` under lock). If we can't actually spawn, we must release it.
+
+**Success case**: Spawn count already incremented at the start, so no need to increment again at the end.
 
 6. **Create ship thread**
 ```c
@@ -629,7 +636,7 @@ pthread_mutex_unlock(&game->mutex_estado);
 ```
 **Why snapshot?** Battery position and direction might change. We need consistent values.
 
-4. **Initialize rocket**
+4. **Initialize rocket** (still holding mutex_foguetes and mutex_lancadores)
 ```c
 game->foguetes[foguete_idx].id = foguete_idx;
 game->foguetes[foguete_idx].x  = (bx < 0) ? 0 : ((bx >= sw) ? sw-1 : bx);
@@ -1576,9 +1583,9 @@ printf("Final Score: %d\n", game.pontuacao);
 
 ### Potential Issues
 
-1. **Double collision detection**: Both ship and rocket threads check collisions. Could double-count, but impact is minimal (stats slightly inflated).
-
-2. **Race in `criar_nave()`**: Between checking `naves_spawned` and actually spawning, another thread could increment. Acceptable (might spawn one extra ship).
+**None!** All identified issues have been fixed:
+1. ✅ **Collision detection**: Fixed with transition gate pattern
+2. ✅ **Ship spawn race**: Fixed with "reserve then commit" pattern
 
 ### Deadlock Prevention
 
